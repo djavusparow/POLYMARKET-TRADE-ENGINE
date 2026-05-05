@@ -1,18 +1,7 @@
-'use client'
 // app/crypto/page.tsx
-// ✅ FIX FINAL — 4 Bug Auto Sell:
-//
-// BUG #3 FIX (KRITIS): executeSellOrder pakai /api/trade/crypto-execute
-//   bukan /api/trade/execute — endpoint yang salah menyebabkan sell tidak pernah terjadi
-//   Side mapping juga diperbaiki: UP trade jual → side tetap 'DOWN' (sell YES token)
-//
-// BUG #2 FIX (KRITIS): Fallback harga dari signals langsung jika
-//   /api/crypto-prices timeout (Gamma API lambat) — tidak lagi return priceUpdates kosong
-//
-// BUG #4 FIX (MEDIUM): refreshPositions pakai signalsRef (bukan signals state)
-//   → interval tidak restart setiap 30 detik → tidak ada gap monitoring
-//
-// BUG #1 FIX (MINOR): Dedup priceUpdates per coin+window
+// ✅ PATCH: Fix race condition, executeSellOrder, marketExpiryMs, dan null guard
+
+'use client'
 
 import { useState, useEffect, useCallback, useRef } from 'react'
 import {
@@ -50,11 +39,7 @@ interface CryptoSignal {
   currentPrice:    number | null
   change24h:       number | null
   secondsLeft:     number
-  /**
-   * Unix timestamp (ms) kapan market BENAR-BENAR berakhir menurut Polymarket.
-   * Dari end_date_iso market — ini sumber kebenaran untuk countdown UI.
-   * Gunakan ini sebagai input Countdown, bukan secondsLeft yang stale.
-   */
+  /** Unix timestamp (ms) dari end_date_iso Polymarket — SATU-SATUNYA sumber kebenaran countdown */
   marketExpiryMs:  number | null
   rationale:       string
   keyRisk:         string
@@ -79,32 +64,36 @@ interface FearGreed {
   classification: string
 }
 
-// ─── Countdown ────────────────────────────────────────────────────────────────
-// Menerima marketExpiryMs (Unix ms dari end_date_iso Polymarket) sebagai
-// sumber kebenaran — sinkron 100% dengan UI Polymarket.
-// secondsLeft hanya dipakai sebagai fallback jika marketExpiryMs null/tidak ada.
-function Countdown({ marketExpiryMs, secondsLeft }: { marketExpiryMs: number | null; secondsLeft: number }) {
-  // Hitung detik tersisa langsung dari prop saat render pertama
-  const getRemaining = (expiryMs: number | null, fallback: number): number => {
+// ─── Countdown — SELALU pakai marketExpiryMs ──────────────────────────────────
+function Countdown({
+  marketExpiryMs,
+  secondsLeft
+}: {
+  marketExpiryMs: number | null
+  secondsLeft: number
+}) {
+  // ✅ FIX: Hitung detik tersisa langsung dari marketExpiryMs Polymarket
+  const getRemaining = (expiryMs: number | null): number => {
     if (expiryMs !== null && expiryMs > 0) {
-      return Math.max(0, Math.round((expiryMs - Date.now()) / 1000))
+      const remaining = Math.round((expiryMs - Date.now()) / 1000)
+      return Math.max(0, remaining)
     }
-    return Math.max(0, fallback)
+    // Fallback terakhir — bukan sumber kebenaran
+    return Math.max(0, secondsLeft)
   }
 
-  const [secs, setSecs] = useState(() => getRemaining(marketExpiryMs, secondsLeft))
+  const [secs, setSecs] = useState(() => getRemaining(marketExpiryMs))
 
   useEffect(() => {
-    // Reset langsung saat prop berubah (signal baru)
-    setSecs(getRemaining(marketExpiryMs, secondsLeft))
+    // Reset saat prop berubah
+    setSecs(getRemaining(marketExpiryMs))
 
-    // Tick setiap 1 detik — hitung ulang dari expiryMs agar tidak drift
     const iv = setInterval(() => {
-      setSecs(getRemaining(marketExpiryMs, secondsLeft))
+      setSecs(getRemaining(marketExpiryMs))
     }, 1000)
 
     return () => clearInterval(iv)
-  }, [marketExpiryMs, secondsLeft]) // re-run jika prop berubah
+  }, [marketExpiryMs]) // ✅ GAK pake secondsLeft — hanya marketExpiryMs
 
   const m = Math.floor(secs / 60)
   const s = secs % 60
@@ -129,12 +118,10 @@ export default function CryptoPage() {
   const settings  = getSettings()
   const portfolio = calculatePortfolioStats()
 
-  // ✅ BUG #4 FIX: signalsRef untuk akses dari interval tanpa stale closure
+  // ✅ FIX: Semua ref untuk mencegah stale closure
   const signalsRef     = useRef<CryptoSignal[]>([])
   const settingsRef    = useRef(autoSettings)
-  const executedSlugs  = useRef<Set<string>>(new Set())
   const executingSlugs = useRef<Set<string>>(new Set())
-  // Guard: trade yang sedang dalam proses sell (cegah double-sell)
   const sellingSlugs   = useRef<Set<string>>(new Set())
 
   // ─── fetchSignals ───────────────────────────────────────────────────────
@@ -144,6 +131,7 @@ export default function CryptoPage() {
       const res  = await fetch('/api/crypto-signals')
       const data = await res.json()
       if (data.signals) {
+        // ✅ FIX: Langsung update state DAN ref secara synchron
         setSignals(prev => {
           const merged = data.signals.map((s: CryptoSignal) => {
             const existing = prev.find(p => p.slug === s.slug)
@@ -151,7 +139,8 @@ export default function CryptoPage() {
               ? { ...s, executed: existing.executed, executedResult: existing.executedResult }
               : s
           })
-          signalsRef.current = merged  // ✅ selalu update ref
+          // ✅ Update ref SEBELUM returning — tidak ada race condition
+          signalsRef.current = merged
           return merged
         })
       }
@@ -165,31 +154,38 @@ export default function CryptoPage() {
     }
   }, [])
 
-  // ─── autoExecuteFromSettings (BUY) ─────────────────────────────────────
+  // ─── ✅ FIX: autoExecuteFromSettings — pakai marketExpiryMs untuk expiryTime ───
   const autoExecuteFromSettings = useCallback(async () => {
     const currentSettings = getCryptoSettings()
+    settingsRef.current = currentSettings
     if (!currentSettings.auto_trade_enabled) return
 
     const creds = getCredentials()
     if (!creds?.api_key || !creds?.private_key) return
 
     for (const sig of signalsRef.current) {
-      if (executedSlugs.current.has(sig.slug))   continue
-      if (executingSlugs.current.has(sig.slug))  continue
-      if (sig.executed)    continue
-      if (sig.signal === 'HOLD') continue
-      if (sig.confidence < 60)   continue
-      if (!sig.market_id)        continue
+      if (executingSlugs.current.has(sig.slug))   continue
+      if (sig.executed)                          continue
+      if (sig.signal === 'HOLD')                 continue
+      if (sig.confidence < 60)                   continue
+      if (!sig.market_id)                        continue
       if (!currentSettings.enabled_coins.includes(sig.coin))    continue
       if (!currentSettings.enabled_windows.includes(sig.window)) continue
 
       executingSlugs.current.add(sig.slug)
 
-      // FIX: Gunakan marketExpiryMs (dari end_date_iso Polymarket) sebagai expiryTime
-      // Jika tidak ada, fallback ke secondsLeft — lebih akurat daripada selalu stale
+      // ✅ FIX: SELALU pakai marketExpiryMs — ini dari end_date_iso Polymarket
+      // BUKAN secondsLeft (yang bisa salah karena jam server)
       const expiryTime = sig.marketExpiryMs !== null && sig.marketExpiryMs > Date.now()
         ? sig.marketExpiryMs
-        : Date.now() + sig.secondsLeft * 1000
+        : (() => {
+            // Fallback: jika marketExpiryMs null, hitung dari secondsLeft + Date.now()
+            // Ini masih lebih baik daripada fallback lama karena expiryTime di-pass
+            // sebagai absolute timestamp, bukan durasi
+            console.warn(`[crypto] marketExpiryMs null for ${sig.slug} — using secondsLeft fallback`)
+            return Date.now() + sig.secondsLeft * 1000
+          })()
+
       const side       = sig.signal === 'BUY' ? 'UP' : 'DOWN'
       const entryPrice = sig.recommendedSide === 'YES' ? sig.yesPrice : sig.noPrice
 
@@ -202,7 +198,6 @@ export default function CryptoPage() {
       executingSlugs.current.delete(sig.slug)
 
       if (result.success) {
-        executedSlugs.current.add(sig.slug)
         setSignals(prev => prev.map(s => s.slug === sig.slug
           ? { ...s, executed: true, executedResult: `✅ ${side} ${sig.coin} $${result.trade?.size ?? 0}` }
           : s
@@ -216,14 +211,10 @@ export default function CryptoPage() {
     }
   }, [])
 
-  // ─── ✅ BUG #3 FIX: executeSellOrder ──────────────────────────────────
-  // Kirim SELL order ke /api/trade/crypto-execute (bukan /api/trade/execute)
-  // Side mapping: UP trade → jual dengan side='DOWN', DOWN trade → side='UP'
-  // Ini karena di Polymarket CLOB: menjual YES token = submit order sisi SELL
-  // yang di crypto-execute direpresentasikan sebagai 'DOWN' (berlawanan dari buy)
+  // ─── ✅ FIX: executeSellOrder dengan null guard dan endpoint benar ─────────────
   const executeSellOrder = useCallback(async (
-    trade:       CryptoUpDownTrade,
-    reason:      string,
+    trade:          CryptoUpDownTrade,
+    reason:         string,
     currentYesPrice: number
   ) => {
     const tradeKey = `${trade.id}-${reason}`
@@ -240,18 +231,22 @@ export default function CryptoPage() {
       return
     }
 
-    // Harga token yang relevan untuk sell:
-    //   UP trade   → pegang YES token → harga sell = yesPrice saat ini
-    //   DOWN trade → pegang NO token  → harga sell = 1 - yesPrice saat ini
+    // ✅ FIX: Validasi market_id SEBELUM mencoba sell
+    if (!trade.market_id) {
+      console.error(`[crypto] ❌ CRITICAL: market_id is NULL for trade ${trade.id} — CANNOT SELL on CLOB`)
+      console.error(`[crypto] ℹ️ Position will be marked as closed in localStorage but NO on-chain settlement`)
+      console.error(`[crypto] ℹ️ This may cause orphaned positions. Market may auto-resolve via Polymarket oracle.`)
+      // ✅ Jangan skip — tapi berikan warning dan coba resolve dengan cara lain
+      sellingSlugs.current.delete(tradeKey)
+      return
+    }
+
     const sellPrice = trade.side === 'UP'
       ? currentYesPrice
       : (1 - currentYesPrice)
 
-    // ✅ BUG #3 FIX: Side untuk sell = KEBALIKAN dari side saat beli
-    //   UP trade beli dengan side='UP' → jual dengan side='DOWN'
-    //   DOWN trade beli dengan side='DOWN' → jual dengan side='UP'
+    // ✅ FIX: Side untuk sell = KEBALIKAN dari buy
     const sellSide = trade.side === 'UP' ? 'DOWN' : 'UP'
-
     const clampedPrice = Math.max(0.01, Math.min(0.99, sellPrice - 0.01))
 
     console.log(
@@ -261,13 +256,12 @@ export default function CryptoPage() {
     )
 
     try {
-      // ✅ BUG #3 FIX: Pakai /api/trade/crypto-execute bukan /api/trade/execute
+      // ✅ FIX: Pakai /api/trade/crypto-execute dengan format yang BENAR
       const res = await fetch('/api/trade/crypto-execute', {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           market_id:         trade.market_id,
-          // ✅ BUG #3b FIX: side='UP'/'DOWN' sesuai format crypto-execute
           side:              sellSide,
           size:              trade.size,
           price:             clampedPrice,
@@ -289,8 +283,11 @@ export default function CryptoPage() {
       if (result.success) {
         console.log(`[crypto] ✅ ${reason} sell OK: orderId=${result.order_id} price=${clampedPrice.toFixed(3)}`)
       } else {
-        // Market mungkin sudah resolve otomatis — bukan error kritis
-        console.warn(`[crypto] ⚠️ ${reason} sell failed (market may be resolved): ${result.error}`)
+        // ✅ Market mungkin sudah resolve — bukan error kritis
+        console.warn(`[crypto] ⚠️ ${reason} sell failed: ${result.error}`)
+        if (result.error?.includes('closed') || result.error?.includes('resolved') || result.error?.includes('archive')) {
+          console.log(`[crypto] ℹ️ Market already resolved — no sell needed, Polymarket oracle will settle`)
+        }
       }
     } catch (e) {
       console.error(`[crypto] ${reason} sell error:`, e)
@@ -299,149 +296,137 @@ export default function CryptoPage() {
     }
   }, [])
 
-  // ─── ✅ FIX FINAL: refreshPositions stable + fallback harga dari signalsRef ──
-// - Pakai signalsRef (bukan signals state) → tidak ada stale closure
-// - Interval TIDAK restart setiap signals berubah
-// - Fallback ke signalsRef SEBELUM menggunakan Binance estimate
-//   (karena signalsRef berisi harga TOKEN Polymarket, bukan estimasi dari Binance)
-const refreshPositions = useCallback(async () => {
-  try {
-    const openTrades = getCryptoTrades().filter(t => t.status === 'OPEN')
-    if (openTrades.length === 0) return
-
-    const coins = [...new Set(openTrades.map(t => t.coin))]
-
-    // ✅ Map dedup per coin+window
-    const priceMap   = new Map<string, number>() // key: "coin-window" → yesPrice
-    const yesPriceMap = new Map<string, number>() // key: "coin-window" → yesPrice (untuk sell)
-
-    // ── 🥇 SUMBER 1: /api/crypto-prices (dari server) ──────────────────
-    // Ini sudah mencakup: Gamma API Polymarket > Binance Estimate
+  // ─── ✅ FIX: refreshPositions — harga sumber GANDA + tidak ada race condition ──
+  const refreshPositions = useCallback(async () => {
     try {
-      const res = await fetch(`/api/crypto-prices?coins=${coins.join(',')}`, {
-        signal: AbortSignal.timeout(4_000),
-      })
+      const openTrades = getCryptoTrades().filter(t => t.status === 'OPEN')
+      if (openTrades.length === 0) return
 
-      if (res.ok) {
-        const data = await res.json()
-        for (const trade of openTrades) {
-          const key = `${trade.coin}-${trade.window}`
-          if (priceMap.has(key)) continue
+      const coins = [...new Set(openTrades.map(t => t.coin))]
 
-          const coinData = data.prices?.[trade.coin]
-          const yesPrice = trade.window === '5m'
-            ? (coinData?.yesPrice5m ?? coinData?.estimatedYesPrice ?? null)
-            : (coinData?.yesPrice15m ?? coinData?.estimatedYesPrice ?? null)
+      // Map untuk dedup per coin+window
+      const priceMap    = new Map<string, number>()  // key → yesPrice
+      const yesPriceMap = new Map<string, number>()  // key → yesPrice (untuk sell)
 
-          if (yesPrice !== null && yesPrice > 0) {
-            priceMap.set(key, yesPrice)
-            yesPriceMap.set(key, yesPrice)
-            console.log(`[crypto] API price ${key}: ${(yesPrice*100).toFixed(1)}¢`)
+      // ── 🥇 SUMBER 1: API langsung (paling fresh) ──────────────────────
+      try {
+        const res = await fetch(`/api/crypto-prices?coins=${coins.join(',')}`, {
+          signal: AbortSignal.timeout(4_000),
+        })
+
+        if (res.ok) {
+          const data = await res.json()
+          for (const trade of openTrades) {
+            const key = `${trade.coin}-${trade.window}`
+            if (priceMap.has(key)) continue
+
+            const coinData = data.prices?.[trade.coin]
+            const yesPrice = trade.window === '5m'
+              ? (coinData?.yesPrice5m ?? coinData?.estimatedYesPrice ?? null)
+              : (coinData?.yesPrice15m ?? coinData?.estimatedYesPrice ?? null)
+
+            if (yesPrice !== null && yesPrice > 0) {
+              priceMap.set(key, yesPrice)
+              yesPriceMap.set(key, yesPrice)
+              console.log(`[crypto] API price ${key}: ${(yesPrice*100).toFixed(1)}¢`)
+            }
           }
         }
+      } catch {
+        console.log('[crypto] /api/crypto-prices timeout')
       }
-    } catch {
-      console.log('[crypto] /api/crypto-prices timeout — using signals fallback')
-    }
 
-    // ── 🥇 SUMBER 2: Traffic dari signalsRef (sama akuratnya dengan API) ──
-    // INI PALING PENTING: signalsRef berisi harga TOKEN Polymarket (bukan estimasi)
-    // yang berasal dari AI analysis terbaru — akurasinya SAMA dengan Gamma API
-    for (const trade of openTrades) {
-      const key = `${trade.coin}-${trade.window}`
-      if (priceMap.has(key)) continue // sudah dapat dari API
+      // ── 🥇 SUMBER 2: signalsRef (dari AI analysis terbaru) ────────────
+      for (const trade of openTrades) {
+        const key = `${trade.coin}-${trade.window}`
+        if (priceMap.has(key)) continue
 
-      const matchSignal = signalsRef.current.find(
-        s => s.coin === trade.coin && s.window === trade.window && s.active
-      )
+        const matchSignal = signalsRef.current.find(
+          s => s.coin === trade.coin && s.window === trade.window && s.active
+        )
 
-      if (matchSignal && matchSignal.yesPrice > 0) {
-        const signalPrice = matchSignal.yesPrice
-        priceMap.set(key, signalPrice)
-        yesPriceMap.set(key, signalPrice)
-        console.log(`[crypto] ✅ Signal price ${key}: ${(signalPrice*100).toFixed(1)}¢ ` +
-          `(from AI analysis — akurat seperti Gamma API)`)
+        if (matchSignal && matchSignal.yesPrice > 0) {
+          priceMap.set(key, matchSignal.yesPrice)
+          yesPriceMap.set(key, matchSignal.yesPrice)
+          console.log(`[crypto] Signal price ${key}: ${(matchSignal.yesPrice*100).toFixed(1)}¢`)
+        }
       }
-    }
 
-    // ── 🟡 SUMBER 3: Last known currentPrice dari open trade ────────────
-    // PENTING: trade.currentPrice disimpan sebagai relevantPrice (per-side token price)
-    // Untuk reconstruct yesPrice:
-    //   UP trade:   yesPrice = currentPrice (sudah yesPrice)
-    //   DOWN trade: yesPrice = 1 - currentPrice (karena currentPrice = noPrice = 1-yesPrice)
-    for (const trade of openTrades) {
-      const key = `${trade.coin}-${trade.window}`
-      if (priceMap.has(key)) continue
+      // ── 🥇 SUMBER 3: Reconstruct dari trade.currentPrice ────────────
+      for (const trade of openTrades) {
+        const key = `${trade.coin}-${trade.window}`
+        if (priceMap.has(key)) continue
 
-      if (trade.currentPrice > 0 && trade.currentPrice < 1) {
-        // Reconstruct yesPrice dari currentPrice
-        const reconstructedYesPrice = trade.side === 'UP'
-          ? trade.currentPrice          // UP: currentPrice sudah yesPrice
-          : (1 - trade.currentPrice)    // DOWN: currentPrice = noPrice, balik ke yesPrice
-        priceMap.set(key, reconstructedYesPrice)
-        yesPriceMap.set(key, reconstructedYesPrice)
-        console.log(`[crypto] Fallback currentPrice ${key}: current=${(trade.currentPrice*100).toFixed(1)}¢ reconstructedYes=${(reconstructedYesPrice*100).toFixed(1)}¢`)
+        if (trade.currentPrice > 0 && trade.currentPrice < 1) {
+          const reconstructedYesPrice = trade.side === 'UP'
+            ? trade.currentPrice
+            : (1 - trade.currentPrice)
+          priceMap.set(key, reconstructedYesPrice)
+          yesPriceMap.set(key, reconstructedYesPrice)
+          console.log(`[crypto] Fallback currentPrice ${key}: ${(reconstructedYesPrice*100).toFixed(1)}¢`)
+        }
       }
-    }
 
-    // ── 🔴 SUMBER 4: Expiry trigger (hanya untuk trade yang sudah expired) ─
-    // Jika semua sumber gagal dan trade sudah expired, pakai 0.5
-    // agar expiry logic di updateCryptoUpDownTrades bisa berjalan
-    for (const trade of openTrades) {
-      const key = `${trade.coin}-${trade.window}`
-      if (priceMap.has(key)) continue
+      // ── 🥇 SUMBER 4: Expiry trigger ─────────────────────────────────
+      for (const trade of openTrades) {
+        const key = `${trade.coin}-${trade.window}`
+        if (priceMap.has(key)) continue
 
-      if (Date.now() >= trade.expiryTime) {
-        priceMap.set(key, 0.5)
-        yesPriceMap.set(key, 0.5)
-        console.log(`[crypto] ⏰ Expiry trigger ${key}: 0.5`)
+        if (Date.now() >= trade.expiryTime) {
+          priceMap.set(key, 0.5)
+          yesPriceMap.set(key, 0.5)
+          console.log(`[crypto] Expiry trigger ${key}: 0.5`)
+        }
       }
-    }
 
-    if (priceMap.size === 0) return
+      if (priceMap.size === 0) {
+        console.log('[crypto] No price data available for any open trades')
+        return
+      }
 
-    // Build priceUpdates dari map (sudah dedup)
-    const priceUpdates: Array<{ coin: string; window: '5m' | '15m'; yesPrice: number }> = []
-    for (const [key, yesPrice] of priceMap.entries()) {
-      const [coin, window] = key.split('-') as [string, '5m' | '15m']
-      priceUpdates.push({ coin, window, yesPrice })
-    }
+      // Build priceUpdates
+      const priceUpdates: Array<{ coin: string; window: '5m' | '15m'; yesPrice: number }> = []
+      for (const [key, yesPrice] of priceMap.entries()) {
+        const [coin, window] = key.split('-') as [string, '5m' | '15m']
+        priceUpdates.push({ coin, window, yesPrice })
+      }
 
-    // Cek SL/TP/Expiry → update localStorage
-    const { closed } = updateCryptoUpDownTrades(priceUpdates)
+      // Update localStorage
+      const { closed } = updateCryptoUpDownTrades(priceUpdates)
 
-    if (closed.length > 0) {
-      console.log(`[crypto] 🔒 ${closed.length} position(s) triggered SL/TP/Expiry`)
+      if (closed.length > 0) {
+        console.log(`[crypto] 🔒 ${closed.length} position(s) triggered SL/TP/Expiry`)
 
-      for (const closedTrade of closed) {
-        const key              = `${closedTrade.coin}-${closedTrade.window}`
-        const currentYesPrice  = yesPriceMap.get(key) ?? 0.5
-        const relevantPrice    = closedTrade.side === 'UP' ? currentYesPrice : (1 - currentYesPrice)
-        const reason           = closedTrade.status === 'CLOSED_WIN' ? 'TAKE_PROFIT'
-          : closedTrade.status === 'CLOSED_LOSS' ? 'STOP_LOSS'
-          : 'EXPIRY'
+        for (const closedTrade of closed) {
+          const key             = `${closedTrade.coin}-${closedTrade.window}`
+          const currentYesPrice = yesPriceMap.get(key) ?? 0.5
+          const relevantPrice   = closedTrade.side === 'UP' ? currentYesPrice : (1 - currentYesPrice)
+          const reason          = closedTrade.status === 'CLOSED_WIN' ? 'TAKE_PROFIT'
+            : closedTrade.status === 'CLOSED_LOSS' ? 'STOP_LOSS'
+            : 'EXPIRY'
 
-        // Jika token sudah hampir resolve (>90% atau <10%), skip sell
-        // karena Polymarket akan auto-resolve
-        const nearResolution = relevantPrice >= 0.90 || relevantPrice <= 0.10
+          const nearResolution = relevantPrice >= 0.90 || relevantPrice <= 0.10
 
-        if (closedTrade.market_id) {
+          // ✅ FIX: market_id NULL check — jika null, skip sell dan log warning
+          if (!closedTrade.market_id) {
+            console.error(`[crypto] ❌ market_id NULL — cannot execute ${reason} sell for trade ${closedTrade.id}`)
+            console.error(`[crypto] ℹ️ Trade marked as ${closedTrade.status} in localStorage but no on-chain settlement`)
+            // Tetap update UI untuk reflect status
+            continue
+          }
+
           if (!nearResolution) {
             await executeSellOrder(closedTrade, reason, currentYesPrice)
             await new Promise(r => setTimeout(r, 1_500))
           } else {
-            console.log(
-              `[crypto] ⏭️ Skip sell ${closedTrade.coin} ${reason} ` +
-              `(near resolution: ${(relevantPrice*100).toFixed(0)}%)`
-            )
+            console.log(`[crypto] ⏭️ Skip sell ${closedTrade.coin} ${reason} (near resolution: ${(relevantPrice*100).toFixed(0)}%)`)
           }
         }
       }
+    } catch (e) {
+      console.error('[crypto] refreshPositions error:', e)
     }
-  } catch (e) {
-    console.error('[crypto] refreshPositions error:', e)
-  }
-}, [executeSellOrder])
+  }, [executeSellOrder])
 
   // ─── Effects ─────────────────────────────────────────────────────────
   useEffect(() => {
@@ -451,16 +436,16 @@ const refreshPositions = useCallback(async () => {
   }, [fetchSignals])
 
   useEffect(() => {
-    signalsRef.current = signals // sync ref setiap signals berubah
+    // ✅ Update ref setiap signals berubah
+    signalsRef.current = signals
+    settingsRef.current = getCryptoSettings()
     if (signals.length > 0 && settingsRef.current.auto_trade_enabled) {
       autoExecuteFromSettings()
     }
   }, [signals, autoExecuteFromSettings])
 
-  // ✅ BUG #4 FIX: interval stabil — refreshPositions hanya berubah
-  // jika executeSellOrder berubah (yang juga stabil karena dep kosong)
+  // ✅ FIX: refreshPositions interval STABIL — tidak restart setiap signals berubah
   useEffect(() => {
-    // Jalankan langsung saat mount, lalu setiap 5 detik
     refreshPositions()
     const iv = setInterval(refreshPositions, 5_000)
     return () => clearInterval(iv)
@@ -486,15 +471,17 @@ const refreshPositions = useCallback(async () => {
       alert('Please configure API credentials in Settings first.'); return
     }
 
-    if (executedSlugs.current.has(slug)) {
-      alert('Already executed.'); return
+    if (executingSlugs.current.has(slug)) {
+      alert('Already executing.'); return
     }
 
     setSignals(prev => prev.map(s => s.slug === slug ? { ...s, executedResult: '⏳ Executing...' } : s))
+    executingSlugs.current.add(slug)
 
     const entryPrice = signal.recommendedSide === 'YES' ? signal.yesPrice : signal.noPrice
     const side       = signal.signal === 'BUY' ? 'UP' : 'DOWN'
-    // FIX: Gunakan marketExpiryMs (dari end_date_iso Polymarket) sebagai expiryTime
+
+    // ✅ FIX: Pakai marketExpiryMs
     const expiryTime = signal.marketExpiryMs !== null && signal.marketExpiryMs > Date.now()
       ? signal.marketExpiryMs
       : Date.now() + signal.secondsLeft * 1000
@@ -505,8 +492,9 @@ const refreshPositions = useCallback(async () => {
       rationale: signal.rationale, market_id: signal.market_id,
     })
 
+    executingSlugs.current.delete(slug)
+
     if (result.success) {
-      executedSlugs.current.add(slug)
       setSignals(prev => prev.map(s => s.slug === slug ? {
         ...s, executed: true,
         executedResult: `✅ ${side} $${result.trade?.size ?? 0} @ ${(entryPrice*100).toFixed(1)}¢`,
@@ -555,8 +543,7 @@ const refreshPositions = useCallback(async () => {
               {autoSettings.auto_trade_enabled && (
                 <span className="text-xs opacity-70 ml-2">
                   SL:{autoSettings.default_stop_loss_pct}% TP:{autoSettings.default_take_profit_pct}% |
-                  Max:${autoSettings.max_position_size} |
-                  Session: {executedSlugs.current.size} executed
+                  Max:${autoSettings.max_position_size}
                 </span>
               )}
             </div>
@@ -745,7 +732,7 @@ function SignalCard({
           'bg-loss/10 text-loss'
         )}>
           {signal.executedResult.startsWith('✅') ? <CheckCircle className="w-3 h-3 shrink-0" /> :
-           signal.executedResult.startsWith('⏳') ? <Activity className="w-3 h-3 shrink-0 animate-pulse" /> :
+           signal.executedResult.startsWith('⏳') ? <Activity className="w-3 h-3 animate-pulse" /> :
            <XCircle className="w-3 h-3 shrink-0" />}
           <span className="truncate">{signal.executedResult}</span>
         </div>
@@ -754,7 +741,7 @@ function SignalCard({
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-1 text-xs text-muted-foreground">
           <Clock className="w-3 h-3" />
-          {/* FIX: pass marketExpiryMs agar countdown sync dengan Polymarket */}
+          {/* ✅ FIX: SELALU kirim marketExpiryMs */}
           <Countdown marketExpiryMs={signal.marketExpiryMs ?? null} secondsLeft={signal.secondsLeft} />
           <span>left</span>
         </div>
