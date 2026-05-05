@@ -1,6 +1,6 @@
 # fly.toml — Konfigurasi Fly.io untuk polymarket-app
 
-app = "polymarket-app"
+app = "polytrade engine"
 primary_region = "nrt"
 kill_signal = "SIGINT"
 kill_timeout = "5s"
