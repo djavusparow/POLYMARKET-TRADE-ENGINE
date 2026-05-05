@@ -1,0 +1,243 @@
+@import 'tailwindcss';
+
+@custom-variant dark (&:is(.dark *));
+
+/* ── Keyframe animations (replaces tw-animate-css) ─────────────────────── */
+@keyframes accordion-down {
+  from { height: 0; opacity: 0; }
+  to { height: var(--radix-accordion-content-height); opacity: 1; }
+}
+@keyframes accordion-up {
+  from { height: var(--radix-accordion-content-height); opacity: 1; }
+  to { height: 0; opacity: 0; }
+}
+@keyframes fade-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes fade-out {
+  from { opacity: 1; }
+  to { opacity: 0; }
+}
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+@keyframes slide-in-from-left {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(0); }
+}
+@keyframes slide-in-from-right {
+  from { transform: translateX(100%); }
+  to { transform: translateX(0); }
+}
+@keyframes slide-in-from-top {
+  from { transform: translateY(-8px); opacity: 0; }
+  to { transform: translateY(0); opacity: 1; }
+}
+@keyframes slide-in-from-bottom {
+  from { transform: translateY(8px); opacity: 0; }
+  to { transform: translateY(0); opacity: 1; }
+}
+@keyframes zoom-in {
+  from { transform: scale(0.96); opacity: 0; }
+  to { transform: scale(1); opacity: 1; }
+}
+@keyframes zoom-out {
+  from { transform: scale(1); opacity: 1; }
+  to { transform: scale(0.96); opacity: 0; }
+}
+
+@layer utilities {
+  .animate-accordion-down { animation: accordion-down 0.2s ease-out; }
+  .animate-accordion-up { animation: accordion-up 0.2s ease-out; }
+  .animate-fade-in { animation: fade-in 0.2s ease-out; }
+  .animate-fade-out { animation: fade-out 0.15s ease-in; }
+  .animate-spin { animation: spin 1s linear infinite; }
+  .animate-pulse { animation: pulse-dot 2s ease-in-out infinite; }
+  .animate-slide-in-from-left { animation: slide-in-from-left 0.3s ease-out; }
+  .animate-slide-in-from-right { animation: slide-in-from-right 0.3s ease-out; }
+  .animate-slide-in-from-top { animation: slide-in-from-top 0.2s ease-out; }
+  .animate-slide-in-from-bottom { animation: slide-in-from-bottom 0.2s ease-out; }
+  .animate-zoom-in { animation: zoom-in 0.2s ease-out; }
+  .animate-zoom-out { animation: zoom-out 0.15s ease-in; }
+}
+
+:root {
+  /* Dark trading terminal — always dark */
+  --background: oklch(0.10 0.005 240);
+  --foreground: oklch(0.94 0.005 240);
+  --card: oklch(0.13 0.007 240);
+  --card-foreground: oklch(0.94 0.005 240);
+  --popover: oklch(0.13 0.007 240);
+  --popover-foreground: oklch(0.94 0.005 240);
+  --primary: oklch(0.65 0.22 160);
+  --primary-foreground: oklch(0.10 0.005 240);
+  --secondary: oklch(0.18 0.008 240);
+  --secondary-foreground: oklch(0.94 0.005 240);
+  --muted: oklch(0.18 0.008 240);
+  --muted-foreground: oklch(0.55 0.01 240);
+  --accent: oklch(0.18 0.008 240);
+  --accent-foreground: oklch(0.94 0.005 240);
+  --destructive: oklch(0.55 0.22 25);
+  --destructive-foreground: oklch(0.94 0.005 240);
+  --border: oklch(0.22 0.008 240);
+  --input: oklch(0.18 0.008 240);
+  --ring: oklch(0.65 0.22 160);
+  --chart-1: oklch(0.65 0.22 160);
+  --chart-2: oklch(0.55 0.22 25);
+  --chart-3: oklch(0.65 0.18 240);
+  --chart-4: oklch(0.75 0.18 90);
+  --chart-5: oklch(0.65 0.20 300);
+  --radius: 0.5rem;
+  --sidebar: oklch(0.12 0.007 240);
+  --sidebar-foreground: oklch(0.94 0.005 240);
+  --sidebar-primary: oklch(0.65 0.22 160);
+  --sidebar-primary-foreground: oklch(0.10 0.005 240);
+  --sidebar-accent: oklch(0.18 0.008 240);
+  --sidebar-accent-foreground: oklch(0.94 0.005 240);
+  --sidebar-border: oklch(0.22 0.008 240);
+  --sidebar-ring: oklch(0.65 0.22 160);
+  /* Semantic trading colors */
+  --profit: oklch(0.65 0.22 160);
+  --loss: oklch(0.58 0.22 25);
+  --signal-buy: oklch(0.62 0.22 155);
+  --signal-sell: oklch(0.58 0.22 15);
+  --signal-neutral: oklch(0.62 0.18 240);
+  --panel: oklch(0.13 0.007 240);
+  --panel-border: oklch(0.22 0.008 240);
+}
+
+.dark {
+  --background: oklch(0.10 0.005 240);
+  --foreground: oklch(0.94 0.005 240);
+  --card: oklch(0.13 0.007 240);
+  --card-foreground: oklch(0.94 0.005 240);
+  --popover: oklch(0.13 0.007 240);
+  --popover-foreground: oklch(0.94 0.005 240);
+  --primary: oklch(0.65 0.22 160);
+  --primary-foreground: oklch(0.10 0.005 240);
+  --secondary: oklch(0.18 0.008 240);
+  --secondary-foreground: oklch(0.94 0.005 240);
+  --muted: oklch(0.18 0.008 240);
+  --muted-foreground: oklch(0.55 0.01 240);
+  --accent: oklch(0.18 0.008 240);
+  --accent-foreground: oklch(0.94 0.005 240);
+  --destructive: oklch(0.55 0.22 25);
+  --destructive-foreground: oklch(0.94 0.005 240);
+  --border: oklch(0.22 0.008 240);
+  --input: oklch(0.18 0.008 240);
+  --ring: oklch(0.65 0.22 160);
+  --chart-1: oklch(0.65 0.22 160);
+  --chart-2: oklch(0.55 0.22 25);
+  --chart-3: oklch(0.65 0.18 240);
+  --chart-4: oklch(0.75 0.18 90);
+  --chart-5: oklch(0.65 0.20 300);
+  --sidebar: oklch(0.12 0.007 240);
+  --sidebar-foreground: oklch(0.94 0.005 240);
+  --sidebar-primary: oklch(0.65 0.22 160);
+  --sidebar-primary-foreground: oklch(0.10 0.005 240);
+  --sidebar-accent: oklch(0.18 0.008 240);
+  --sidebar-accent-foreground: oklch(0.94 0.005 240);
+  --sidebar-border: oklch(0.22 0.008 240);
+  --sidebar-ring: oklch(0.65 0.22 160);
+  --profit: oklch(0.65 0.22 160);
+  --loss: oklch(0.58 0.22 25);
+  --signal-buy: oklch(0.62 0.22 155);
+  --signal-sell: oklch(0.58 0.22 15);
+  --signal-neutral: oklch(0.62 0.18 240);
+  --panel: oklch(0.13 0.007 240);
+  --panel-border: oklch(0.22 0.008 240);
+}
+
+@theme inline {
+  --font-sans: 'Inter', 'Inter Fallback';
+  --font-mono: 'Fira Code', 'Fira Code Fallback', monospace;
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-profit: var(--profit);
+  --color-loss: var(--loss);
+  --color-signal-buy: var(--signal-buy);
+  --color-signal-sell: var(--signal-sell);
+  --color-signal-neutral: var(--signal-neutral);
+  --color-panel: var(--panel);
+  --color-panel-border: var(--panel-border);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+  /* Custom scrollbar for dark trading terminal */
+  ::-webkit-scrollbar {
+    width: 4px;
+    height: 4px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: oklch(0.28 0.008 240);
+    border-radius: 2px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: oklch(0.35 0.01 240);
+  }
+  /* Range input thumb */
+  input[type='range']::-webkit-slider-thumb {
+    appearance: none;
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    background: oklch(0.65 0.22 160);
+    cursor: pointer;
+  }
+  input[type='range']::-moz-range-thumb {
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    background: oklch(0.65 0.22 160);
+    cursor: pointer;
+    border: none;
+  }
+}

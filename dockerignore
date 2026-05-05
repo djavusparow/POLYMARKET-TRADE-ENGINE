@@ -1,0 +1,15 @@
+# .dockerignore — File yang tidak perlu masuk ke Docker image
+
+node_modules
+.next
+.git
+.gitignore
+*.md
+.env
+.env.*
+.vercel
+.DS_Store
+Thumbs.db
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
