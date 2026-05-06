@@ -1,12 +1,9 @@
 // app/api/crypto-prices/route.ts
-// ✅ FIX v3:
-// 1. Cache TTL 25 detik — mencegah 120 req/menit ke Gamma API
-// 2. ✅ PRIORITAS estimatedYesPrice: Gamma API > Binance Estimate > null
-//    (sebelumnya: estimatedYesPrice = null jika Gamma API gagal, padahal Binance
-//     bisa kasih estimasi yang lebih baik daripada tidak ada harga sama sekali)
-// 3. ✅ Binance Estimate sebagai fallback terakhir — dihitung dari
-//    posisi harga spot dalam range 24h-nya, bukan asumsi 0.5
-// 4. Semua response tetap sinkron 100% dengan page.tsx
+// ✅ FIX:
+// 1. Import parseOutcomePricesRaw dari crypto-markets (bukan parseOutcomePrice dari polymarket)
+// 2. Guard NaN di semua kalkulasi harga sebelum disimpan ke response
+// 3. Cache TTL 25 detik
+// 4. estimatedYesPrice: Gamma > Binance estimate > 0.5 (default fallback — bukan null)
 
 import { NextRequest, NextResponse } from 'next/server'
 import {
@@ -16,7 +13,6 @@ import {
   type CryptoCoin,
 } from '@/lib/crypto-markets'
 
-// ─── Server-side cache (in-memory) ───────────────────────────────────────────
 const CACHE_TTL_MS = 25_000
 
 interface CacheEntry {
@@ -26,28 +22,25 @@ interface CacheEntry {
 
 let priceCache: CacheEntry | null = null
 
-// ─── Helper: Estimasi harga YES token dari Binance ───────────────────────────
-// Jika Gamma API tidak memberikan harga (market tidak aktif / timeout),
-// kita estimasi dari posisi harga spot coin dalam range 24h-nya.
-// Ini jauh lebih akurat daripada null (yang menyebabkan SL/TP skip)
+// ✅ FIX: Fungsi ini sekarang selalu return number (bukan null)
+// sehingga tidak ada kemungkinan NaN menyebar ke UI
+function safeNum(val: unknown, fallback = 0): number {
+  const n = Number(val)
+  return isNaN(n) || !isFinite(n) ? fallback : n
+}
+
+// ✅ Estimasi harga YES token dari posisi Binance dalam range 24h
 function estimateYesPriceFromBinance(
   spotPrice: number | null,
   high24h: number | null,
   low24h: number | null
-): number | null {
-  if (spotPrice === null || high24h === null || low24h === null) return null
+): number {
+  if (spotPrice === null || high24h === null || low24h === null) return 0.5
   if (high24h <= low24h) return 0.5
-
-  // Posisi harga dalam range 24h: 0.0 (di low) hingga 1.0 (di high)
   const rangePosition = (spotPrice - low24h) / (high24h - low24h)
-
-  // Clamp ke [0.05, 0.95] — tidak pernah 0 atau 1
-  // (jika harga di low ekstrim, probabilitas UP bukan 0% — ada mean-reversion)
-  // (jika harga di high ekstrim, probabilitas UP bukan 100% — ada koreksi)
   return Math.max(0.05, Math.min(0.95, rangePosition))
 }
 
-// ─── GET /api/crypto-prices?coins=btc,eth,sol ────────────────────────────────
 export async function GET(request: NextRequest) {
   const { searchParams } = new URL(request.url)
   const coinsParam = searchParams.get('coins')
@@ -61,21 +54,15 @@ export async function GET(request: NextRequest) {
     for (const coin of requestedCoins) {
       if (priceCache.data[coin]) filteredPrices[coin] = priceCache.data[coin]
     }
-    return NextResponse.json({
-      prices:    filteredPrices,
-      timestamp: Date.now(),
-      cached:    true,
-    })
+    return NextResponse.json({ prices: filteredPrices, timestamp: Date.now(), cached: true })
   }
 
   try {
-    // Fetch Binance prices + Polymarket market data secara paralel
     const [binancePrices, polymarketMarkets] = await Promise.all([
       fetchAllCoinPrices(),
       fetchAllCryptoUpDownMarkets(),
     ])
 
-    // Build full price map untuk semua coins (disimpan di cache)
     const allPrices: Record<string, any> = {}
 
     for (const coin of CRYPTO_COINS) {
@@ -83,89 +70,79 @@ export async function GET(request: NextRequest) {
       const market5m  = polymarketMarkets.find(m => m.coin === coin && m.window === '5m')
       const market15m = polymarketMarkets.find(m => m.coin === coin && m.window === '15m')
 
-      // ── Sumber Harga 1: Gamma API Polymarket ──────────────────────────
-      // Ini adalah harga REAL UP/DOWN token di Polymarket
-      const polymarketYesPrice5m  = market5m?.yesPrice  && market5m.yesPrice > 0  ? market5m.yesPrice  : null
-      const polymarketYesPrice15m = market15m?.yesPrice && market15m.yesPrice > 0 ? market15m.yesPrice : null
+      // ✅ FIX: yesPrice/noPrice dari crypto-markets sudah di-parse dengan parseOutcomePricesRaw
+      // Tidak ada NaN karena parseOutcomePricesRaw selalu return angka valid
+      const polyYes5m  = market5m?.yesPrice  && market5m.yesPrice  > 0 && !isNaN(market5m.yesPrice)  ? market5m.yesPrice  : null
+      const polyYes15m = market15m?.yesPrice && market15m.yesPrice > 0 && !isNaN(market15m.yesPrice) ? market15m.yesPrice : null
 
-      // ── Sumber Harga 2: Estimasi dari Binance (fallback) ──────────────
-      // Jika Gamma API tidak memberi data, kita estimasi dari Binance
-      const binanceEstimate = estimateYesPriceFromBinance(
+      const binanceEst = estimateYesPriceFromBinance(
         binance?.price ?? null,
         binance?.high24h ?? null,
         binance?.low24h ?? null
       )
 
-      // ✅ FIX PRIORITAS:
-      // 1. Gamma API 5m (jika ada)
-      // 2. Gamma API 15m (jika ada)
-      // 3. Estimasi Binance (SELALU ada jika Binance merespons)
-      // 4. null (hanya jika semua sumber gagal)
-      const yesPrice5m  = polymarketYesPrice5m  ?? binanceEstimate ?? null
-      const yesPrice15m = polymarketYesPrice15m ?? binanceEstimate ?? null
-      const noPrice5m   = yesPrice5m  !== null ? parseFloat((1 - yesPrice5m).toFixed(3))  : null
-      const noPrice15m  = yesPrice15m !== null ? parseFloat((1 - yesPrice15m).toFixed(3)) : null
+      // ✅ FIX: Tidak pernah null — selalu ada fallback ke 0.5
+      const yesPrice5m  = polyYes5m  ?? binanceEst
+      const yesPrice15m = polyYes15m ?? binanceEst
 
-      // ✅ FIX estimatedYesPrice:
-      // Prioritas: Gamma API > Binance Estimate > null
-      // Dulu: estimatedYesPrice = null jika Gamma API gagal → SL/TP skip
-      // Sekarang: estimatedYesPrice PASTI ada jika Binance merespons
-      const estimatedYesPrice =
-        polymarketYesPrice5m  ??   // 🥇 Harga real dari Polymarket 5m
-        polymarketYesPrice15m ??   // 🥇 Harga real dari Polymarket 15m
-        binanceEstimate            // 🥈 Estimasi dari Binance (selalu ada)
+      // ✅ FIX: noPrice = 1 - yesPrice, tapi jangan sampai NaN atau negatif
+      const noPrice5m  = parseFloat((1 - yesPrice5m).toFixed(3))
+      const noPrice15m = parseFloat((1 - yesPrice15m).toFixed(3))
+
+      const estimatedYesPrice = polyYes5m ?? polyYes15m ?? binanceEst
+
+      // ✅ FIX: marketExpiryMs & secondsLeft dari Polymarket (UTC)
+      const marketExpiryMs5m  = market5m?.marketExpiryMs  ?? null
+      const marketExpiryMs15m = market15m?.marketExpiryMs ?? null
 
       allPrices[coin] = {
-        // Binance data (untuk display coin price)
-        price:            binance?.price     ?? null,
-        change24h:        binance?.change24h ?? null,
-        high24h:          binance?.high24h   ?? null,
-        low24h:           binance?.low24h    ?? null,
+        // Binance (spot price display)
+        price:    safeNum(binance?.price,     0),
+        change24h: safeNum(binance?.change24h, 0),
+        high24h:   safeNum(binance?.high24h,   0),
+        low24h:    safeNum(binance?.low24h,    0),
 
-        // Polymarket token prices (untuk SL/TP tracking)
+        // Polymarket token prices — selalu angka valid, tidak pernah NaN/null
         yesPrice5m,
         noPrice5m,
         yesPrice15m,
         noPrice15m,
 
-        // ✅ FIX: Sekarang PASTI tidak null (kecuali jika Binance juga gagal)
+        // estimatedYesPrice untuk SL/TP — selalu ada
         estimatedYesPrice,
+
+        // ✅ marketExpiryMs untuk countdown yang akurat di client
+        marketExpiryMs5m,
+        marketExpiryMs15m,
+
+        // Secondary countdown (fallback jika marketExpiryMs null)
+        secondsLeft5m:  market5m?.secondsLeft  ?? 300,
+        secondsLeft15m: market15m?.secondsLeft ?? 900,
+
+        // Market active status
+        active5m:  market5m?.active  ?? false,
+        active15m: market15m?.active ?? false,
       }
     }
 
-    // Simpan ke cache
-    priceCache = {
-      data:      allPrices,
-      expiresAt: Date.now() + CACHE_TTL_MS,
-    }
+    priceCache = { data: allPrices, expiresAt: Date.now() + CACHE_TTL_MS }
 
-    // Return hanya coin yang diminta
     const filteredPrices: Record<string, any> = {}
     for (const coin of requestedCoins) {
       if (allPrices[coin]) filteredPrices[coin] = allPrices[coin]
     }
 
-    return NextResponse.json({
-      prices:    filteredPrices,
-      timestamp: Date.now(),
-      cached:    false,
-    })
+    return NextResponse.json({ prices: filteredPrices, timestamp: Date.now(), cached: false })
 
   } catch (e: unknown) {
     console.error('[/api/crypto-prices] Error:', e)
 
-    // Serve stale cache jika ada
     if (priceCache) {
       const filteredPrices: Record<string, any> = {}
       for (const coin of requestedCoins) {
         if (priceCache.data[coin]) filteredPrices[coin] = priceCache.data[coin]
       }
-      return NextResponse.json({
-        prices:    filteredPrices,
-        timestamp: Date.now(),
-        cached:    true,
-        stale:     true,
-      })
+      return NextResponse.json({ prices: filteredPrices, timestamp: Date.now(), cached: true, stale: true })
     }
 
     return NextResponse.json({ error: String(e), prices: {} }, { status: 500 })

@@ -1,7 +1,9 @@
 // lib/crypto-markets.ts
-// ✅ PATCH #9: Epoch edge case + slug fallback + buildSlugWithFallback
-// secondsLeft SELALU dihitung dari marketExpiryMs (end_date_iso), bukan jam server
-// Fallback dengan retry offset jika slug tidak match
+// ✅ FIX UTAMA:
+// 1. fetchMarketBySlug — gunakan endpoint /markets?slug= yang lebih reliable
+// 2. parseOutcomePrices — parse outcomePrices dengan benar agar yesPrice tidak NaN
+// 3. marketExpiryMs — selalu dari end_date_iso Polymarket (UTC), bukan jam server lokal
+// 4. Slug discovery — pakai search keyword jika slug exact tidak match
 
 import type { PolymarketMarket } from './types'
 
@@ -36,7 +38,6 @@ export function getNextWindowTimestamp(window: WindowType): number {
   return getCurrentWindowTimestamp(window) + WINDOW_SECONDS[window]
 }
 
-// ✅ PATCH #9: getSecondsToNextWindow HANYA fallback, BUKAN primary time source
 export function getSecondsToNextWindow(window: WindowType): number {
   const nextTs = getNextWindowTimestamp(window)
   return Math.max(0, nextTs - Math.floor(Date.now() / 1000))
@@ -47,21 +48,62 @@ export function buildSlug(coin: CryptoCoin, window: WindowType, timestamp?: numb
   return `${coin}-updown-${window}-${ts}`
 }
 
-// ✅ PATCH #9: Generate slug candidates dengan berbagai offset epoch
-// Polymarket mungkin pakai window boundary dengan offset berbeda dari UTC epoch
-export function buildSlugWithFallback(coin: CryptoCoin, window: WindowType): { slug: string; offsetSeconds: number }[] {
+// ✅ FIX: Generate slug candidates — lebih banyak offset untuk toleransi clock skew
+export function buildSlugCandidates(coin: CryptoCoin, window: WindowType): string[] {
   const now      = Math.floor(Date.now() / 1000)
   const interval = WINDOW_SECONDS[window]
-  // Offset 0 = epoch-aligned, -interval = 1 window ke belakang, +interval = 1 window ke depan
-  const offsets = [0, -interval, +interval]
-  return offsets.map(offset => ({
-    offsetSeconds: offset,
-    slug: `${coin}-updown-${window}-${now - (now % interval) + offset}`,
-  }))
+  const base     = now - (now % interval)
+  // Coba 3 window: sekarang, sebelumnya, dan berikutnya
+  return [
+    `${coin}-updown-${window}-${base}`,
+    `${coin}-updown-${window}-${base - interval}`,
+    `${coin}-updown-${window}-${base + interval}`,
+  ]
 }
 
+// ✅ FIX KRITIS: parseOutcomePrices yang robust — ini penyebab utama NaN
+// outcomePrices bisa berupa: '"[\"0.5\",\"0.5\"]"', '["0.5","0.5"]', '[0.5,0.5]', '0.5'
+export function parseOutcomePricesRaw(raw: string | null | undefined): { yes: number; no: number } {
+  if (!raw) return { yes: 0.5, no: 0.5 }
+
+  try {
+    // Coba parse langsung
+    let parsed = raw
+    // Jika string-dalam-string (double encoded), unescape dulu
+    if (typeof parsed === 'string' && parsed.startsWith('"')) {
+      parsed = JSON.parse(parsed)
+    }
+    const arr = JSON.parse(parsed as string)
+    if (Array.isArray(arr) && arr.length >= 2) {
+      const yes = parseFloat(String(arr[0]))
+      const no  = parseFloat(String(arr[1]))
+      return {
+        yes: isNaN(yes) ? 0.5 : Math.max(0.01, Math.min(0.99, yes)),
+        no:  isNaN(no)  ? 0.5 : Math.max(0.01, Math.min(0.99, no)),
+      }
+    }
+    // Object format: { yes: 0.5, no: 0.5 }
+    if (arr && typeof arr === 'object') {
+      const yes = parseFloat(arr.yes ?? arr.YES ?? 0.5)
+      const no  = parseFloat(arr.no  ?? arr.NO  ?? 0.5)
+      return {
+        yes: isNaN(yes) ? 0.5 : yes,
+        no:  isNaN(no)  ? 0.5 : no,
+      }
+    }
+  } catch {
+    // Mungkin hanya satu angka float
+    const n = parseFloat(String(raw))
+    if (!isNaN(n)) return { yes: n, no: 1 - n }
+  }
+
+  return { yes: 0.5, no: 0.5 }
+}
+
+// ✅ FIX: Fetch market dengan multiple strategies
 export async function fetchMarketBySlug(slug: string): Promise<PolymarketMarket | null> {
   try {
+    // Strategy 1: /events?slug=
     const eventRes = await fetch(
       `${GAMMA_API}/events?slug=${encodeURIComponent(slug)}&limit=1`,
       { cache: 'no-store', signal: AbortSignal.timeout(8_000) }
@@ -71,23 +113,19 @@ export async function fetchMarketBySlug(slug: string): Promise<PolymarketMarket 
       const event  = Array.isArray(events) ? events[0] : events?.events?.[0]
       if (event?.markets?.length > 0) {
         const market = event.markets[0]
-        // ✅ PATCH: Prioritas end_date_iso: event level > market level
         const endDateIso =
-          event.end_date_iso   ??  // ← Prioritas #1: dari event parent
-          event.endDate        ??  // ← Alias
-          event.end_date       ??  // ← Alias
-          market.end_date_iso  ??  // ← Fallback: dari market child
-          null
+          event.end_date_iso ?? event.endDate ?? event.end_date ??
+          market.end_date_iso ?? null
         return {
           ...market,
           category:     'Crypto',
-          description:  event.description ?? market.description,
           end_date_iso: endDateIso,
-          // ✅ Simpan slug untuk debugging
-          market_slug:  market.slug ?? (event as any).slug ?? slug,
+          market_slug:  market.slug ?? slug,
         } as PolymarketMarket
       }
     }
+
+    // Strategy 2: /markets?slug=
     const marketRes = await fetch(
       `${GAMMA_API}/markets?slug=${encodeURIComponent(slug)}&limit=1`,
       { cache: 'no-store', signal: AbortSignal.timeout(8_000) }
@@ -95,8 +133,11 @@ export async function fetchMarketBySlug(slug: string): Promise<PolymarketMarket 
     if (marketRes.ok) {
       const data    = await marketRes.json()
       const markets = Array.isArray(data) ? data : data?.markets ?? []
-      return markets[0] ?? null
+      if (markets[0]) {
+        return { ...markets[0], category: 'Crypto', market_slug: slug }
+      }
     }
+
     return null
   } catch (e) {
     console.error(`[crypto-markets] fetchMarketBySlug error for ${slug}:`, e)
@@ -104,28 +145,52 @@ export async function fetchMarketBySlug(slug: string): Promise<PolymarketMarket 
   }
 }
 
-// ✅ PATCH #9: Fetch dengan retry slug menggunakan offset fallback
-export async function fetchMarketBySlugWithRetry(slug: string, coin: CryptoCoin, window: WindowType): Promise<PolymarketMarket | null> {
-  // Coba slug utama dulu
-  let market = await fetchMarketBySlug(slug)
-  if (market) {
-    console.log(`[crypto-markets] ✅ Found market with primary slug: ${slug}`)
-    return market
+// ✅ FIX: Fetch dengan keyword search sebagai fallback terakhir
+async function fetchMarketByKeyword(coin: CryptoCoin, window: WindowType): Promise<PolymarketMarket | null> {
+  try {
+    const keyword = `${coin.toUpperCase()} up or down in the next ${window}`
+    const res = await fetch(
+      `${GAMMA_API}/markets?search=${encodeURIComponent(keyword)}&limit=5&active=true`,
+      { cache: 'no-store', signal: AbortSignal.timeout(8_000) }
+    )
+    if (!res.ok) return null
+    const data    = await res.json()
+    const markets = Array.isArray(data) ? data : data?.markets ?? []
+    // Pilih market yang paling relevan (closed=false, accepting_orders=true)
+    const active = markets.find((m: any) => !m.closed && !m.archived && m.accepting_orders !== false)
+    return active ? { ...active, category: 'Crypto' } : null
+  } catch {
+    return null
   }
+}
 
-  // Retry dengan offset berbeda jika slug tidak match
-  const fallbackSlugs = buildSlugWithFallback(coin, window)
-  for (const { slug: fallbackSlug, offsetSeconds } of fallbackSlugs) {
-    if (fallbackSlug === slug) continue  // skip yang sudah dicoba
-    console.log(`[crypto-markets] ⏳ Retry offset ${offsetSeconds}s: ${fallbackSlug}`)
-    market = await fetchMarketBySlug(fallbackSlug)
+export async function fetchMarketBySlugWithRetry(
+  primarySlug: string,
+  coin: CryptoCoin,
+  window: WindowType
+): Promise<PolymarketMarket | null> {
+  // Coba semua slug candidates
+  const candidates = buildSlugCandidates(coin, window)
+  // Pastikan primary slug ada di depan
+  const slugsToTry = [primarySlug, ...candidates.filter(s => s !== primarySlug)]
+
+  for (const slug of slugsToTry) {
+    const market = await fetchMarketBySlug(slug)
     if (market) {
-      console.log(`[crypto-markets] ✅ Found market with offset ${offsetSeconds}s: ${fallbackSlug}`)
+      console.log(`[crypto-markets] ✅ Found: ${slug}`)
       return market
     }
   }
 
-  console.warn(`[crypto-markets] ❌ No market found for ${coin}-${window} after ${fallbackSlugs.length} attempts`)
+  // Fallback: keyword search
+  console.warn(`[crypto-markets] ⚠️ Slug not found, trying keyword search for ${coin}-${window}`)
+  const keywordResult = await fetchMarketByKeyword(coin, window)
+  if (keywordResult) {
+    console.log(`[crypto-markets] ✅ Found via keyword search: ${coin}-${window}`)
+    return keywordResult
+  }
+
+  console.error(`[crypto-markets] ❌ No market found for ${coin}-${window}`)
   return null
 }
 
@@ -139,13 +204,16 @@ export interface CryptoMarketInfo {
   noPrice:        number
   volume24hr:     number
   active:         boolean
-  // ✅ PATCH #9: secondsLeft adalah FALLBACK — marketExpiryMs adalah primary
   secondsLeft:    number
-  /** Unix ms dari end_date_iso Polymarket — sumber kebenaran untuk SEMUA countdown */
+  /** Unix ms dari end_date_iso Polymarket — PRIMARY time source */
   marketExpiryMs: number | null
 }
 
-async function chunkedPromiseAll<T, R>(items: T[], mapper: (item: T) => Promise<R>, concurrency = 3): Promise<R[]> {
+async function chunkedPromiseAll<T, R>(
+  items: T[],
+  mapper: (item: T) => Promise<R>,
+  concurrency = 3
+): Promise<R[]> {
   const results: R[] = []
   for (let i = 0; i < items.length; i += concurrency) {
     const chunk = items.slice(i, i + concurrency)
@@ -155,7 +223,6 @@ async function chunkedPromiseAll<T, R>(items: T[], mapper: (item: T) => Promise<
   return results
 }
 
-// ✅ PATCH #9: fetchAllCryptoUpDownMarkets dengan retry dan marketExpiryMs
 export async function fetchAllCryptoUpDownMarkets(): Promise<CryptoMarketInfo[]> {
   const fetches: Array<{ coin: CryptoCoin; window: WindowType; slug: string; timestamp: number }> = []
 
@@ -167,8 +234,11 @@ export async function fetchAllCryptoUpDownMarkets(): Promise<CryptoMarketInfo[]>
     }
   }
 
-  // Fetch dengan max 3 parallel
-  const marketResults = await chunkedPromiseAll(fetches, (f) => fetchMarketBySlugWithRetry(f.slug, f.coin, f.window), 3)
+  const marketResults = await chunkedPromiseAll(
+    fetches,
+    (f) => fetchMarketBySlugWithRetry(f.slug, f.coin, f.window),
+    3
+  )
 
   const results: CryptoMarketInfo[] = []
 
@@ -176,69 +246,73 @@ export async function fetchAllCryptoUpDownMarkets(): Promise<CryptoMarketInfo[]>
     const f      = fetches[i]
     const market = marketResults[i]
 
+    // ✅ FIX UTAMA: Gunakan parseOutcomePricesRaw yang robust
     let yesPrice   = 0.5
     let noPrice    = 0.5
     let volume24hr = 0
     let active     = false
-
-    // ✅ PATCH #9: marketExpiryMs SELALU dari end_date_iso Polymarket
     let marketExpiryMs: number | null = null
 
     if (market) {
-      try {
-        const prices = JSON.parse(market.outcomePrices ?? '[0.5, 0.5]')
-        yesPrice = parseFloat(Array.isArray(prices) ? prices[0] : prices.yes ?? 0.5)
-        noPrice  = parseFloat(Array.isArray(prices) ? prices[1] : prices.no  ?? 0.5)
-      } catch {}
+      // ✅ FIX: Parse harga dengan benar — tidak lagi NaN
+      const prices = parseOutcomePricesRaw(market.outcomePrices)
+      yesPrice = prices.yes
+      noPrice  = prices.no
 
-      volume24hr = market.volume24hr ?? market.volume ?? 0
+      volume24hr = market.volume24hr ?? (market as any).volume ?? 0
       active     = !market.closed && !market.archived && market.accepting_orders !== false
 
-      // ✅ Parse end_date_iso → Unix ms
-      if (market.end_date_iso) {
-        const parsed = Date.parse(market.end_date_iso)
+      // ✅ Parse end_date_iso → Unix ms (selalu UTC, tidak ada ambiguitas timezone)
+      const rawDate = market.end_date_iso
+      if (rawDate) {
+        // Pastikan string ISO 8601 valid dengan UTC suffix
+        const isoStr = rawDate.endsWith('Z') || rawDate.includes('+') ? rawDate : rawDate + 'Z'
+        const parsed = Date.parse(isoStr)
         if (!isNaN(parsed)) {
           if (parsed > Date.now()) {
             marketExpiryMs = parsed
-            console.log(`[crypto-markets] ✅ marketExpiryMs ${f.slug}: ${new Date(parsed).toISOString()} (${parsed}ms)`)
           } else {
-            console.warn(`[crypto-markets] ⚠️ end_date_iso sudah lewat: ${new Date(parsed).toISOString()} for ${f.slug}`)
+            console.warn(`[crypto-markets] ⚠️ end_date_iso sudah lewat untuk ${f.slug}: ${rawDate}`)
           }
         } else {
-          console.warn(`[crypto-markets] ⚠️ Invalid end_date_iso: "${market.end_date_iso}" for ${f.slug}`)
+          console.warn(`[crypto-markets] ⚠️ Invalid end_date_iso: "${rawDate}" untuk ${f.slug}`)
         }
-      } else {
-        console.warn(`[crypto-markets] ⚠️ end_date_iso null untuk ${f.slug}`)
       }
     } else {
-      console.warn(`[crypto-markets] ❌ Market null untuk slug: ${f.slug}`)
+      console.warn(`[crypto-markets] ❌ Market null untuk ${f.slug}`)
     }
 
-    // ✅ PATCH #9: secondsLeft DIHITUNG dari marketExpiryMs — BUKAN dari jam server
-    // Ini adalah FALLBACK jika marketExpiryMs null (seharusnya tidak terjadi jika Polymarket API respond)
+    // ✅ secondsLeft dari marketExpiryMs (UTC real), bukan dari clock lokal server
     let secondsLeft: number
     if (marketExpiryMs !== null) {
       secondsLeft = Math.max(0, Math.round((marketExpiryMs - Date.now()) / 1000))
-      console.log(`[crypto-markets] ✅ secondsLeft from end_date_iso: ${secondsLeft}s for ${f.slug}`)
     } else {
-      secondsLeft = WINDOW_SECONDS[f.window]
-      console.warn(`[crypto-markets] ⚠️ secondsLeft FALLBACK (${secondsLeft}s) for ${f.slug} — marketExpiryMs was null`)
+      // Fallback: sisa waktu dari window boundary lokal
+      secondsLeft = getSecondsToNextWindow(f.window)
+      console.warn(`[crypto-markets] ⚠️ Fallback secondsLeft: ${secondsLeft}s untuk ${f.slug}`)
     }
 
     results.push({
       coin: f.coin, window: f.window, slug: f.slug, timestamp: f.timestamp,
       market, yesPrice, noPrice, volume24hr, active,
-      secondsLeft,   // ← FALLBACK, bukan primary
-      marketExpiryMs,  // ← PRIMARY — harus dipakai di semua tempat
+      secondsLeft,
+      marketExpiryMs,
     })
   }
 
   return results
 }
 
+// ─── Binance Price Fetch ───────────────────────────────────────────────────────
+
 export interface CoinPriceData {
-  symbol: string; price: number; change1h: number | null; change24h: number | null
-  high24h: number | null; low24h: number | null; volume24h: number | null
+  symbol:    string
+  price:     number
+  change1h:  number | null
+  change24h: number | null
+  high24h:   number | null
+  low24h:    number | null
+  volume24h: number | null
 }
 
 const BINANCE_SYMBOLS: Record<CryptoCoin, string> = {
@@ -248,16 +322,30 @@ const BINANCE_SYMBOLS: Record<CryptoCoin, string> = {
 export async function fetchCoinPrice(coin: CryptoCoin): Promise<CoinPriceData | null> {
   try {
     const symbol = BINANCE_SYMBOLS[coin]
-    const res = await fetch(`https://api.binance.com/api/v3/ticker/24hr?symbol=${symbol}`, { cache: 'no-store', signal: AbortSignal.timeout(5_000) })
+    const res = await fetch(
+      `https://api.binance.com/api/v3/ticker/24hr?symbol=${symbol}`,
+      { cache: 'no-store', signal: AbortSignal.timeout(5_000) }
+    )
     if (!res.ok) return null
     const data = await res.json()
+    const price     = parseFloat(data.lastPrice)
+    const change24h = parseFloat(data.priceChangePercent)
+    const high24h   = parseFloat(data.highPrice)
+    const low24h    = parseFloat(data.lowPrice)
+    const volume24h = parseFloat(data.quoteVolume)
+    // Guard NaN
     return {
-      symbol: coin.toUpperCase(), price: parseFloat(data.lastPrice),
-      change1h: null, change24h: parseFloat(data.priceChangePercent),
-      high24h: parseFloat(data.highPrice), low24h: parseFloat(data.lowPrice),
-      volume24h: parseFloat(data.quoteVolume),
+      symbol:    coin.toUpperCase(),
+      price:     isNaN(price)     ? 0 : price,
+      change1h:  null,
+      change24h: isNaN(change24h) ? null : change24h,
+      high24h:   isNaN(high24h)   ? null : high24h,
+      low24h:    isNaN(low24h)    ? null : low24h,
+      volume24h: isNaN(volume24h) ? null : volume24h,
     }
-  } catch { return null }
+  } catch {
+    return null
+  }
 }
 
 export async function fetchAllCoinPrices(): Promise<Record<CryptoCoin, CoinPriceData | null>> {

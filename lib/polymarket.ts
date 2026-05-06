@@ -1,5 +1,6 @@
 // lib/polymarket.ts
-// Updated: Menambahkan deteksi slug 'crypto-updown' pada enrichment market
+// ✅ FIX: parseOutcomePrice sekarang robust — tidak bisa return NaN
+// Penyebab utama NaN di seluruh UI: outcomePrices double-encoded JSON string
 
 import type { PolymarketMarket, MarketPrice } from './types'
 
@@ -7,9 +8,10 @@ const GAMMA_API = 'https://gamma-api.polymarket.com'
 const CLOB_API  = 'https://clob.polymarket.com'
 const DATA_API  = 'https://data-api.polymarket.com'
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
 function safeUUID(): string {
-  try { return crypto.randomUUID() } catch { return `${Date.now()}-${Math.random().toString(36).slice(2, 10)}` }
+  try { return crypto.randomUUID() } catch {
+    return `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
+  }
 }
 
 // ─── Tradeable Market Filter ──────────────────────────────────────────────────
@@ -32,21 +34,17 @@ export function isMarketTradeable(market: PolymarketMarket): boolean {
   return true
 }
 
-// ─── Enrich dengan category ├─ deteksi slug ───────────────────────────────────
 function enrichMarketCategory(market: PolymarketMarket, event?: any): PolymarketMarket {
-  // Jika sudah ada category, gunakan
   if (market.category?.toLowerCase() === 'crypto') return market
 
-  const q = (market.question ?? '').toLowerCase()
-
-  // Deteksi crypto up/down via slug
+  const q    = (market.question ?? '').toLowerCase()
   const slug = ((market as any).slug ?? q).toLowerCase()
+
   if (
     slug.includes('updown') ||
     slug.includes('up-down') ||
     (slug.includes('up') && slug.includes('down'))
   ) {
-    // Cek apakah ada coin di question
     const coins = ['btc', 'bitcoin', 'eth', 'ethereum', 'sol', 'solana', 'doge', 'dogecoin', 'xrp']
     if (coins.some(c => q.includes(c))) {
       return { ...market, category: 'Crypto' }
@@ -56,16 +54,12 @@ function enrichMarketCategory(market: PolymarketMarket, event?: any): Polymarket
   return market
 }
 
-// ─── Trending Markets ─────────────────────────────────────────────────────────
 export async function fetchTrendingMarkets(limit = 20): Promise<PolymarketMarket[]> {
   try {
     const fetchLimit = Math.min(limit * 3, 100)
     const params = new URLSearchParams({
-      active:    'true',
-      closed:    'false',
-      limit:     String(fetchLimit),
-      order:     'volume24hr',
-      ascending: 'false',
+      active: 'true', closed: 'false', limit: String(fetchLimit),
+      order: 'volume24hr', ascending: 'false',
     })
 
     const res = await fetch(`${GAMMA_API}/events?${params}`, {
@@ -73,21 +67,15 @@ export async function fetchTrendingMarkets(limit = 20): Promise<PolymarketMarket
       headers: { 'Accept': 'application/json' },
     })
 
-    if (!res.ok) {
-      console.error(`[polymarket] /events error: ${res.status}`)
-      return fetchTopVolumeMarkets(limit)
-    }
+    if (!res.ok) return fetchTopVolumeMarkets(limit)
 
     const events = await res.json()
-    if (!Array.isArray(events) || events.length === 0) {
-      return fetchTopVolumeMarkets(limit)
-    }
+    if (!Array.isArray(events) || events.length === 0) return fetchTopVolumeMarkets(limit)
 
     const markets: PolymarketMarket[] = []
 
     for (const event of events) {
       if (!event.markets || !Array.isArray(event.markets)) continue
-
       for (const m of event.markets) {
         const enriched: PolymarketMarket = {
           ...m,
@@ -95,12 +83,8 @@ export async function fetchTrendingMarkets(limit = 20): Promise<PolymarketMarket
           volume24hr: m.volume24hr ?? event.volume24hr,
           volume:     m.volume     ?? event.volume,
         }
-
-        if (isMarketTradeable(enriched)) {
-          markets.push(enriched)
-        }
+        if (isMarketTradeable(enriched)) markets.push(enriched)
       }
-
       if (markets.length >= limit) break
     }
 
@@ -113,54 +97,39 @@ export async function fetchTrendingMarkets(limit = 20): Promise<PolymarketMarket
       }
     }
 
-    return markets
-      .sort((a, b) => (b.volume24hr ?? 0) - (a.volume24hr ?? 0))
-      .slice(0, limit)
-
+    return markets.sort((a, b) => (b.volume24hr ?? 0) - (a.volume24hr ?? 0)).slice(0, limit)
   } catch (e) {
     console.error('[polymarket] fetchTrendingMarkets error:', e)
     return fetchTopVolumeMarkets(limit)
   }
 }
 
-// ─── Top Volume Markets (fallback) ────────────────────────────────────────────
 export async function fetchTopVolumeMarkets(limit = 20): Promise<PolymarketMarket[]> {
   try {
-    const fetchLimit = Math.min(limit * 2, 100)
     const params = new URLSearchParams({
-      active:    'true',
-      closed:    'false',
-      limit:     String(fetchLimit),
-      order:     'volume24hr',
-      ascending: 'false',
+      active: 'true', closed: 'false', limit: String(Math.min(limit * 2, 100)),
+      order: 'volume24hr', ascending: 'false',
     })
     const res = await fetch(`${GAMMA_API}/markets?${params}`, { cache: 'no-store' })
     if (!res.ok) throw new Error(`Gamma API ${res.status}`)
     const data = await res.json()
-    const markets = Array.isArray(data) ? data : []
-    return markets.filter(isMarketTradeable).slice(0, limit)
+    return (Array.isArray(data) ? data : []).filter(isMarketTradeable).slice(0, limit)
   } catch (e) {
     console.error('[polymarket] fetchTopVolumeMarkets error:', e)
     return []
   }
 }
 
-// ─── Active Markets ───────────────────────────────────────────────────────────
 export async function fetchActiveMarkets(limit = 50): Promise<PolymarketMarket[]> {
   try {
-    const fetchLimit = Math.min(limit * 2, 100)
     const params = new URLSearchParams({
-      active: 'true',
-      closed: 'false',
-      limit:  String(fetchLimit),
-      order:  'volume24hr',
-      ascending: 'false',
+      active: 'true', closed: 'false', limit: String(Math.min(limit * 2, 100)),
+      order: 'volume24hr', ascending: 'false',
     })
     const res = await fetch(`${GAMMA_API}/markets?${params}`, { cache: 'no-store' })
     if (!res.ok) throw new Error(`Gamma API error: ${res.status}`)
     const data = await res.json()
-    const markets = Array.isArray(data) ? data : []
-    return markets.filter(isMarketTradeable).slice(0, limit)
+    return (Array.isArray(data) ? data : []).filter(isMarketTradeable).slice(0, limit)
   } catch (e) {
     console.error('[polymarket] fetchActiveMarkets error:', e)
     return []
@@ -176,12 +145,9 @@ export async function fetchMarketByConditionId(conditionId: string): Promise<Pol
     if (!res.ok) return null
     const data = await res.json()
     return Array.isArray(data) && data.length > 0 ? data[0] : null
-  } catch {
-    return null
-  }
+  } catch { return null }
 }
 
-// ─── CLOB Price Data ──────────────────────────────────────────────────────────
 export async function fetchTokenPrice(tokenId: string): Promise<MarketPrice | null> {
   try {
     const [bidRes, askRes] = await Promise.all([
@@ -194,9 +160,7 @@ export async function fetchTokenPrice(tokenId: string): Promise<MarketPrice | nu
     const askPrice = parseFloat(ask?.price ?? '0')
     const mid = bidPrice > 0 && askPrice > 0 ? (bidPrice + askPrice) / 2 : bidPrice || askPrice
     return { token_id: tokenId, price: mid, bid: bidPrice, ask: askPrice }
-  } catch {
-    return null
-  }
+  } catch { return null }
 }
 
 export async function fetchMidpointPrices(tokenIds: string[]): Promise<Record<string, number>> {
@@ -221,7 +185,7 @@ export async function fetchLastTradePrices(tokenIds: string[]): Promise<Record<s
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(tokenIds.map((id) => ({ token_id: id }))),
     })
-    if (!res.ok) throw new Error(`last-trades-prices fetch failed: ${res.status}`)
+    if (!res.ok) throw new Error(`last-trades-prices failed: ${res.status}`)
     const data = await res.json()
     return data.last_trades ?? {}
   } catch { return {} }
@@ -244,7 +208,6 @@ export async function fetchTickSize(tokenId: string): Promise<string> {
   } catch { return '0.01' }
 }
 
-// ─── Portfolio / Positions ────────────────────────────────────────────────────
 export async function fetchUserPositions(walletAddress: string) {
   try {
     const res = await fetch(
@@ -269,38 +232,65 @@ export async function fetchUserTrades(walletAddress: string, limit = 50) {
   } catch { return [] }
 }
 
-// ─── Route Handler Wrappers ───────────────────────────────────────────────────
 export async function serverFetchMarkets(limit = 50): Promise<PolymarketMarket[]> {
   return fetchTrendingMarkets(limit)
 }
-
 export async function serverFetchTopMarkets(): Promise<PolymarketMarket[]> {
   return fetchTrendingMarkets(20)
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
 export function getYesNoTokenIds(market: PolymarketMarket): { yes: string; no: string } | null {
   const tokens = market.clobTokenIds
   if (!tokens || tokens.length < 2) return null
   return { yes: tokens[0], no: tokens[1] }
 }
 
-export function parseOutcomePrice(outcomePrices: string): number {
+// ✅ FIX KRITIS: parseOutcomePrice yang robust — tidak bisa return NaN
+// outcomePrices dari Gamma API bisa berupa berbagai format:
+// 1. '["0.872","0.128"]'       — array string (paling umum)
+// 2. '"[\"0.872\",\"0.128\"]"' — double-encoded JSON string
+// 3. '[0.872, 0.128]'          — array number
+// 4. '{"yes":0.872,"no":0.128}'— object
+// 5. '0.872'                   — single float string
+export function parseOutcomePrice(outcomePrices: string | null | undefined): number {
   if (!outcomePrices) return 0
+
   try {
-    const parsed = JSON.parse(outcomePrices)
-    if (typeof parsed?.yes === 'number')      return parsed.yes
-    if (typeof parsed?.yesPrice === 'number') return parsed.yesPrice
-    if (Array.isArray(parsed) && parsed[0])   return parseFloat(parsed[0]) || 0
-    return 0
+    let raw: any = outcomePrices
+
+    // Handle double-encoded string: '"[...]"' → '[...]'
+    if (typeof raw === 'string' && raw.startsWith('"') && raw.endsWith('"')) {
+      raw = JSON.parse(raw)
+    }
+
+    // Parse JSON
+    if (typeof raw === 'string') {
+      raw = JSON.parse(raw)
+    }
+
+    // Array format: [YES_price, NO_price]
+    if (Array.isArray(raw) && raw.length >= 1) {
+      const n = parseFloat(String(raw[0]))
+      return isNaN(n) ? 0 : Math.max(0, Math.min(1, n))
+    }
+
+    // Object format
+    if (raw && typeof raw === 'object') {
+      const n = parseFloat(raw.yes ?? raw.YES ?? raw.yesPrice ?? 0)
+      return isNaN(n) ? 0 : Math.max(0, Math.min(1, n))
+    }
+
+    // Scalar
+    const n = parseFloat(String(raw))
+    return isNaN(n) ? 0 : Math.max(0, Math.min(1, n))
   } catch {
-    const n = parseFloat(outcomePrices)
-    return isNaN(n) ? 0 : n
+    const n = parseFloat(String(outcomePrices))
+    return isNaN(n) ? 0 : Math.max(0, Math.min(1, n))
   }
 }
 
-export function formatVolume(vol: number | undefined): string {
-  if (!vol) return '$0'
+export function formatVolume(vol: number | undefined | null): string {
+  if (!vol || isNaN(vol)) return '$0'
   if (vol >= 1_000_000) return `$${(vol / 1_000_000).toFixed(1)}M`
   if (vol >= 1_000)     return `$${(vol / 1_000).toFixed(1)}K`
   return `$${vol.toFixed(0)}`
